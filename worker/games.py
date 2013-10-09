@@ -430,9 +430,11 @@ def run_games(worker_info, password, remote, run, task_id):
     games_concurrency = 1
     pgnout = []
   else:
+    ts = time.time()
+    st = datetime.datetime.fromtimestamp(ts).strftime('%Y%m%d-%H%M')
     worker_threads = 1
     games_to_play = games_remaining
-    pgnout = ['-pgnout', 'results.pgn']
+    pgnout = ['-pgnout', 'results-%s.pgn' % st]
 
   # Run cutechess-cli binary
   cmd = [ cutechess, '-repeat', '-rounds', str(games_to_play), '-tournament', 'gauntlet'] + pgnout + \
@@ -440,7 +442,7 @@ def run_games(worker_info, password, remote, run, task_id):
          'movecount=8', 'score=20', '-concurrency', str(games_concurrency)] + pgn_cmd + \
         ['-engine', 'name=stockfish', 'cmd=stockfish'] + new_options + \
         ['_clop_','-engine', 'name=base', 'cmd=base'] + base_options + \
-        ['_clop_','-each', 'proto=uci', 'option.Threads=%d' % (threads), 'tc=%s' % (scaled_tc)] + book_cmd
+        ['_clop_','-each', 'proto=uci', 'whitepov=false', 'option.Threads=%d' % (threads), 'tc=%s' % (scaled_tc)] + book_cmd
 
   payload = (cmd, remote, result, clop_tuning, regression_test, tc_limit * games_to_play / min(games_to_play, games_concurrency))
 
