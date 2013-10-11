@@ -1,6 +1,9 @@
 import copy
 import datetime
+import numpy
 import os
+import scipy
+import scipy.stats
 import sys
 import json
 import smtplib
@@ -161,14 +164,13 @@ def users(request):
       username = run['args']['username']
       info[username]['tests'] += 1
 
-    tc = parse_tc(run['args']['tc'])
-
     for task in run['tasks']:
       if 'worker_info' not in task:
         continue
       username = task['worker_info'].get('username', None)
       if username == None:
         continue
+      tc = parse_tc(run['args']['tc'])
 
       if 'stats' in task:
         stats = task['stats']
@@ -356,6 +358,7 @@ def tests_approve(request):
 def tests_delete(request):
   run = request.rundb.get_run(request.POST['run-id'])
   run['deleted'] = True
+  run['finished'] = True
   for w in run['tasks']:
     w['pending'] = False
   request.rundb.runs.save(run)
@@ -417,6 +420,57 @@ def format_results(run_results, run):
     result['style'] = '#44EB44'
   return result
 
+def get_worker_key(task):
+  if 'worker_info' not in task:
+    return '-'
+  return '%s-%scores' % (task['worker_info'].get('username', ''), str(task['worker_info']['concurrency']))
+
+def get_chi2(tasks):
+  """Perform chi^2 test on the stats from each worker"""
+  results = {'chi2': 0.0, 'dof': 0, 'p': 0.0, 'residual': {}}
+
+  # Aggregate results by worker
+  users = {}
+  for task in tasks: 
+    if 'worker_info' not in task:
+      continue
+    key = get_worker_key(task)
+    stats = task.get('stats', {})
+    wld = [float(stats.get('wins', 0)), float(stats.get('losses', 0)), float(stats.get('draws', 0))]
+    if wld == [0.0, 0.0, 0.0]:
+      continue
+    if key in users:
+      for idx in range(len(wld)):
+        users[key][idx] += wld[idx] 
+    else:
+      users[key] = wld 
+
+  if len(users) == 0:
+    return results
+
+  observed = numpy.array(users.values())
+  rows,columns = observed.shape
+  df = (rows - 1) * (columns - 1)
+  column_sums = numpy.sum(observed, axis=0)
+  row_sums = numpy.sum(observed, axis=1)
+  grand_total = numpy.sum(column_sums)
+  if grand_total == 0:
+    return results
+
+  expected = numpy.outer(row_sums, column_sums) / grand_total
+  diff = observed - expected
+  adj = numpy.outer((1 - row_sums / grand_total), (1 - column_sums / grand_total))
+  residual = diff / numpy.sqrt(expected * adj)
+  for idx in range(len(users)):
+    users[users.keys()[idx]] = numpy.max(numpy.abs(residual[idx]))
+  chi2 = numpy.sum(diff * diff / expected)
+  return {
+    'chi2': chi2,
+    'dof': df,
+    'p': 1 - scipy.stats.chi2.cdf(chi2, df),
+    'residual': users,
+  }
+
 @view_config(route_name='tests_view', renderer='tests_view.mak')
 def tests_view(request):
   run = request.rundb.get_run(request.matchdict['id'])
@@ -458,14 +512,24 @@ def tests_view(request):
 
     run_args.append((name, value, url))
 
+  chi2 = get_chi2(run['tasks'])
   for task in run['tasks']:
+    task['worker_key'] = get_worker_key(task)
+    task['residual'] = chi2['residual'].get(task['worker_key'], 0.0)
+    if abs(task['residual']) < 2.0:
+      task['residual_color'] = '#44EB44'
+    elif abs(task['residual']) < 3.0:
+      task['residual_color'] = 'yellow'
+    else:
+      task['residual_color'] = '#FF6A6A'
+
     last_updated = task.get('last_updated', datetime.datetime.min)
     task['last_updated'] = delta_date(last_updated)
 
   if 'clop' in run['args']:
     run['games'] = [g for g in request.clopdb.get_games(run['_id'])]
 
-  return { 'run': run, 'run_args': run_args }
+  return { 'run': run, 'run_args': run_args, 'chi2': chi2 }
 
 def post_result(run):
 
@@ -499,37 +563,30 @@ def post_result(run):
 @view_config(route_name='tests', renderer='tests.mak')
 @view_config(route_name='tests_user', renderer='tests.mak')
 def tests(request):
-  username = request.matchdict.get('username','')
-  filter_by_user = True if len(username) > 0 else False
+  username = request.matchdict.get('username', '')
 
   runs = { 'pending':[], 'failed':[], 'active':[], 'finished':[] }
 
-  all_runs = request.rundb.get_runs()
-
-  for run in all_runs:
-    if 'deleted' in run:
-      continue
-
-    if filter_by_user and run['args'].get('username', '') != username:
+  unfinished_runs = request.rundb.get_unfinished_runs()
+  for run in unfinished_runs:
+    if len(username) > 0 and run['args'].get('username', '') != username:
       continue
 
     results = request.rundb.get_results(run)
-    if not run['finished']:
-      run['results_info'] = format_results(results, run)
+    run['results_info'] = format_results(results, run)
 
     state = 'finished'
 
-    if not run['finished']:
-      for task in run['tasks']:
-        if task['active']:
-          state = 'active'
-        elif task['pending'] and not state == 'active':
-          state = 'pending'
+    for task in run['tasks']:
+      if task['active']:
+        state = 'active'
+      elif task['pending'] and not state == 'active':
+        state = 'pending'
 
-      if state == 'finished':
-        run['finished'] = True
-        request.rundb.runs.save(run)
-        post_result(run)
+    if state == 'finished':
+      run['finished'] = True
+      request.rundb.runs.save(run)
+      post_result(run)
 
     if state == 'finished' and results['wins'] + results['losses'] + results['draws'] == 0:
       state = 'failed'
@@ -577,22 +634,23 @@ def tests(request):
   games_played = sum([total_games(r) for r in runs['finished']])
 
   # Pagination
-  finished_runs = len(runs['finished'])
   page = int(request.params.get('page', 1)) - 1
   page_size = 50
+  finished, num_finished = request.rundb.get_finished_runs(skip=page*page_size, limit=page_size, username=username)
+  runs['finished'] += finished
+
   pages = [{'idx': 'Prev', 'url': '?page=%d' % (page), 'state': 'disabled' if page == 0 else ''}]
-  for idx, page_idx in enumerate(range(0, finished_runs, page_size)):
+  for idx, page_idx in enumerate(range(0, num_finished, page_size)):
     pages.append({'idx': idx + 1, 'url': '?page=%d' % (idx + 1), 'state': 'active' if page == idx else ''})
   pages.append({'idx': 'Next', 'url': '?page=%d' % (page + 2), 'state': 'disabled' if page + 1 == len(pages) - 1 else ''})
-  runs['finished'] = runs['finished'][page*page_size:(page+1)*page_size]
 
   return {
     'runs': runs,
-    'finished_runs': finished_runs,
+    'finished_runs': num_finished,
     'page_idx': page,
     'pages': pages,
     'machines': machines,
-    'show_machines': not filter_by_user,
+    'show_machines': len(username) == 0,
     'pending_hours': '%.1f' % (pending_hours),
     'games_played': games_played,
     'cores': cores,

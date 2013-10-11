@@ -36,7 +36,7 @@
     </button>
   </form>
 %if not run.get('approved', False):
-  <span> 
+  <span>
     <a href="https://github.com/mcostalba/Stockfish/compare/master...${run['args']['resolved_base'][:7]}" target="_blank">Master diff</a>
     <form action="/tests/approve" method="POST" style="display:inline">
       <input type="hidden" name="run-id" value="${run['_id']}">
@@ -63,6 +63,15 @@
     <input type="hidden" name="run" value="${run['_id']}" />
     <button type="submit" class="btn btn-primary">Modify</button>
   </form>
+
+  <hr>
+
+  <h4>Stats</h4>
+  <table class="table table-condensed">
+    <tr><td>chi^2</td><td>${'%.2f' % (chi2['chi2'])}</td></tr>
+    <tr><td>dof</td><td>${chi2['dof']}</td></tr>
+    <tr><td>p-value</td><td>${'%.2f' % (chi2['p'] * 100)}%</td></tr>
+  </table>
 </div>
 
 </div>
@@ -128,6 +137,8 @@
    <th>Draws</th>
    %endif
    <th>Crashes</th>
+   <th>Time</th>
+   <th>Residual</th>
   </tr>
  </thead>
  <tbody>
@@ -139,11 +150,6 @@
     else:
       continue
 
-    if 'worker_info' in task:
-      machine_info = task['worker_info'].get('username', '') + '-' + str(task['worker_info']['concurrency']) + 'cores'
-    else:
-      machine_info = '-'
-
     if task['active'] and task['pending']:
       active_style = 'info'
     elif task['active'] and not task['pending']:
@@ -153,7 +159,7 @@
   %>
   <tr class="${active_style}">
    <td>${idx}</td>
-   <td>${machine_info}</td>
+   <td>${task['worker_key']}</td>
    <td>${str(task.get('last_updated', '-')).split('.')[0]}</td>
    <td>${total} / ${task['num_games']}</td>
    %if 'clop' in run['args']:
@@ -164,6 +170,8 @@
    <td>${stats.get('draws', '-')}</td>
    %endif
    <td>${stats.get('crashes', '-')}</td>
+   <td>${stats.get('time_losses', '-')}</td>
+   <td style="background-color:${task['residual_color']}">${'%.3f' % (task['residual'])}</td>
   </tr>
   %endfor
  </tbody>

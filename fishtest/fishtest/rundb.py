@@ -23,6 +23,9 @@ class RunDb:
 
     self.chunk_size = 1000
 
+  def build_indices(self):
+    self.runs.ensure_index([('finished', ASCENDING), ('last_updated', DESCENDING)])
+
   def generate_tasks(self, num_games):
     tasks = []
     remaining = num_games
@@ -129,25 +132,30 @@ class RunDb:
   def get_run_to_build(self):
     return self.runs.find_one({'binaries_url': {'$exists': False}, 'finished': False, 'deleted': {'$exists': False}})
 
-  def get_runs(self, skip=0, limit=0):
-    runs = []
-    for run in self.runs.find(skip=skip,
-                              limit=limit,
-                              sort=[('last_updated', DESCENDING), ('start_time', DESCENDING)]):
-      runs.append(run)
-    return runs
+  def get_runs(self):
+    return list(self.runs.find(sort=[('last_updated', DESCENDING), ('start_time', DESCENDING)]))
+
+  def get_unfinished_runs(self):
+    return self.runs.find({'finished': False},
+                          sort=[('last_updated', DESCENDING), ('start_time', DESCENDING)])
+
+  def get_finished_runs(self, skip=0, limit=0, username=''):
+    q = {'finished': True, 'deleted': {'$exists': False}}
+    if len(username) > 0:
+      q['args.username'] = username
+
+    c = self.runs.find(q, skip=skip, limit=limit, sort=[('last_updated', DESCENDING)])
+    return (list(c), c.count())
 
   def get_clop_exclusion_list(self, minimum):
     exclusion_list = []
     for run in self.runs.find({'args.clop': {'$exists': True}, 'finished': False, 'deleted': {'$exists': False}}):
-      total_games = 0
       available_games = 0
       for game in self.clopdb.get_games(run['_id']):
-        total_games += 1
         if len(game['task_id']) == 0:
           available_games += 1
 
-      if total_games > 0 and available_games < minimum:
+      if available_games < minimum:
         exclusion_list.append(run['_id'])
     return exclusion_list
 
@@ -155,7 +163,7 @@ class RunDb:
     if not run['results_stale']:
       return run['results']
 
-    results = { 'wins': 0, 'losses': 0, 'draws': 0, 'crashes': 0 }
+    results = { 'wins': 0, 'losses': 0, 'draws': 0, 'crashes': 0, 'time_losses':0 }
     for task in run['tasks']:
       if 'stats' in task:
         stats = task['stats']
@@ -163,6 +171,7 @@ class RunDb:
         results['losses'] += stats['losses']
         results['draws'] += stats['draws']
         results['crashes'] += stats['crashes']
+        results['time_losses'] += stats.get('time_losses', 0)
 
     if 'sprt' in run['args'] and 'state' in run['args']['sprt']:
       results['sprt'] = run['args']['sprt']['state']
