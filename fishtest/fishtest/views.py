@@ -354,6 +354,45 @@ def tests_approve(request):
   request.session.flash('Approved run')
   return HTTPFound(location=request.route_url('tests'))
 
+@view_config(route_name='tests_purge', permission='approve_run')
+def tests_purge(request):
+  username = authenticated_userid(request)
+
+  run = request.rundb.get_run(request.POST['run-id'])
+  if not run['finished']:
+    request.session.flash('Can only purge completed run')
+    return HTTPFound(location=request.route_url('tests'))
+
+  # Remove bad runs
+  calculate_residuals(run)
+  if 'bad_tasks' not in run:
+    run['bad_tasks'] = []
+  for task in run['tasks']:
+    if task['residual'] > 3.0:
+      run['bad_tasks'].append(task)
+      del task['stats']
+      task['pending'] = True
+
+  if len(run['bad_tasks']) == 0:
+    request.session.flash('No bad workers!')
+    return HTTPFound(location=request.route_url('tests'))
+
+  # Generate new tasks if needed
+  run['results_stale'] = True
+  results = request.rundb.get_results(run)
+  played_games = results['wins'] + results['losses'] + results['draws']
+  request.rundb.generate_tasks(run['args']['num_games'] - played_games)
+
+  run['finished'] = False
+  if 'sprt' in run['args']:
+    del run['args']['sprt']['state']
+
+  request.rundb.runs.save(run)
+  request.actiondb.purge_run(username, run)
+
+  request.session.flash('Purged run')
+  return HTTPFound(location=request.route_url('tests'))
+
 @view_config(route_name='tests_delete', permission='modify_db')
 def tests_delete(request):
   run = request.rundb.get_run(request.POST['run-id'])
@@ -425,25 +464,28 @@ def get_worker_key(task):
     return '-'
   return '%s-%scores' % (task['worker_info'].get('username', ''), str(task['worker_info']['concurrency']))
 
-def get_chi2(tasks):
+def get_chi2(tasks, bad_users):
   """Perform chi^2 test on the stats from each worker"""
   results = {'chi2': 0.0, 'dof': 0, 'p': 0.0, 'residual': {}}
 
   # Aggregate results by worker
   users = {}
-  for task in tasks: 
+  for task in tasks:
+    task['worker_key'] = get_worker_key(task)
     if 'worker_info' not in task:
       continue
     key = get_worker_key(task)
+    if key in bad_users:
+      continue
     stats = task.get('stats', {})
     wld = [float(stats.get('wins', 0)), float(stats.get('losses', 0)), float(stats.get('draws', 0))]
     if wld == [0.0, 0.0, 0.0]:
       continue
     if key in users:
       for idx in range(len(wld)):
-        users[key][idx] += wld[idx] 
+        users[key][idx] += wld[idx]
     else:
-      users[key] = wld 
+      users[key] = wld
 
   if len(users) == 0:
     return results
@@ -470,6 +512,36 @@ def get_chi2(tasks):
     'p': 1 - scipy.stats.chi2.cdf(chi2, df),
     'residual': users,
   }
+
+def calculate_residuals(run):
+  bad_users = set()
+  chi2 = get_chi2(run['tasks'], bad_users)
+  residuals = chi2['residual']
+
+  while True:
+    worst_user = {}
+    for task in run['tasks']:
+      if task['worker_key'] in bad_users:
+        continue
+      task['residual'] = residuals.get(task['worker_key'], 0.0)
+      if abs(task['residual']) < 2.0:
+        task['residual_color'] = '#44EB44'
+      elif abs(task['residual']) < 3.0:
+        task['residual_color'] = 'yellow'
+      else:
+        task['residual_color'] = '#FF6A6A'
+
+      if chi2['p'] < 0.01:
+        if len(worst_user) == 0 or task['residual'] > worst_user['residual']:
+            worst_user['worker_key'] = task['worker_key']
+            worst_user['residual'] = task['residual']
+
+    if len(worst_user) == 0:
+      break
+    bad_users.update(worst_user['worker_key'])
+    residuals = get_chi2(run['tasks'], bad_users)['residual']
+
+  return chi2
 
 @view_config(route_name='tests_view', renderer='tests_view.mak')
 def tests_view(request):
@@ -512,27 +584,16 @@ def tests_view(request):
 
     run_args.append((name, value, url))
 
-  chi2 = get_chi2(run['tasks'])
   for task in run['tasks']:
-    task['worker_key'] = get_worker_key(task)
-    task['residual'] = chi2['residual'].get(task['worker_key'], 0.0)
-    if abs(task['residual']) < 2.0:
-      task['residual_color'] = '#44EB44'
-    elif abs(task['residual']) < 3.0:
-      task['residual_color'] = 'yellow'
-    else:
-      task['residual_color'] = '#FF6A6A'
-
     last_updated = task.get('last_updated', datetime.datetime.min)
     task['last_updated'] = delta_date(last_updated)
 
   if 'clop' in run['args']:
     run['games'] = [g for g in request.clopdb.get_games(run['_id'])]
 
-  return { 'run': run, 'run_args': run_args, 'chi2': chi2 }
+  return { 'run': run, 'run_args': run_args, 'chi2': calculate_residuals(run)}
 
 def post_result(run):
-
   title = run['args']['new_tag'][:23]
 
   if 'username' in run['args']:
@@ -634,7 +695,7 @@ def tests(request):
   games_played = sum([total_games(r) for r in runs['finished']])
 
   # Pagination
-  page = int(request.params.get('page', 1)) - 1
+  page = max(0, int(request.params.get('page', 1)) - 1)
   page_size = 50
   finished, num_finished = request.rundb.get_finished_runs(skip=page*page_size, limit=page_size, username=username)
   runs['finished'] += finished
