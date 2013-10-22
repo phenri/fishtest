@@ -89,6 +89,7 @@ class RunDb:
     new_run = {
       'args': run_args,
       'start_time': start_time,
+      'last_updated': start_time,
       # Will be filled in by tasks, indexed by task-id
       'tasks': self.generate_tasks(num_games),
       # Aggregated results
@@ -184,10 +185,8 @@ class RunDb:
 
   def request_task(self, worker_info):
     # Check for blocked user or ip
-    with open('blocked_users.txt') as f:
-      blocked = f.read()
-      if worker_info['remote_addr'] in blocked or worker_info['username'] in blocked:
-        return {'task_waiting': False}
+    if self.userdb.is_blocked(worker_info):
+      return {'task_waiting': False}
 
     # Build list of CLOP runs that are already almost full
     max_threads = int(worker_info['concurrency'])
